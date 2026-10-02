@@ -1,0 +1,8 @@
+streamlit
+pandas
+psycopg2-binary
+pgvector
+groq
+sentence-transformers
+numpy
+python-dotenv
