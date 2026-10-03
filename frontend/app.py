@@ -165,25 +165,34 @@ if st.session_state.results:
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
+                if msg.get("chart"):
+                    st.caption(msg["chart"]["title"])
+                    st.bar_chart(msg["chart"]["data"])
 
-        question = st.chat_input("e.g. Why is Incorrect Fit rising?")
+        question = st.chat_input("e.g. Why is Incorrect Fit rising?  or  Show a chart of reviews per problem")
         if question:
             st.session_state.chat_history.append({"role": "user", "content": question})
             with st.chat_message("user"):
                 st.write(question)
 
+            chart = None
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     conn = get_connection()
                     try:
-                        answer, sources = answer_question(
+                        answer, sources, chart = answer_question(
                             question, results, conn, st.session_state.upload_id
                         )
                     except Exception as e:
                         answer = f"Sorry, that failed: {e}"
                     conn.close()
                 st.write(answer)
+                if chart:
+                    st.caption(chart["title"])
+                    st.bar_chart(chart["data"])
 
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.session_state.chat_history.append(
+                {"role": "assistant", "content": answer, "chart": chart}
+            )
 else:
     st.info("Upload a file (or click 'Use sample data') and click 'Run analysis' to get started.")

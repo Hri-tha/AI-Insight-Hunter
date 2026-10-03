@@ -37,16 +37,25 @@ def get_embedding(text):
     return get_embedder().encode(text)
 
 
-def llm(prompt, json_mode=True):
+def llm(prompt, json_mode=True, max_completion_tokens=2000, system=None):
     """
     Sends one prompt to Groq and returns the raw text reply.
+
+    system: optional system prompt (the assistant's role, tone and rules).
+    Leave it as None for the pipeline steps that don't need one.
 
     json_mode=True tells Groq the reply MUST be a JSON object (a {...}, not
     a bare [...] list) — every prompt in this project that wants JSON back
     is written to ask for an object wrapping a list, to satisfy this.
 
-    If Groq returns a rate-limit or temporary server error, this waits and
-    retries automatically instead of crashing the whole pipeline run.
+    max_completion_tokens caps the reply length. This matters a lot in JSON
+    mode: if the model's answer gets cut off mid-object because it ran out
+    of room, Groq rejects it with "Failed to validate JSON" — raising this
+    for bigger prompts (e.g. tagging a whole batch of reviews) avoids that.
+
+    If Groq returns a rate-limit, temporary server error, or a JSON
+    validation failure, this waits and retries automatically instead of
+    crashing the whole pipeline run.
     """
     extra = {"response_format": {"type": "json_object"}} if json_mode else {}
 
@@ -55,12 +64,18 @@ def llm(prompt, json_mode=True):
     if "gpt-oss" in GROQ_MODEL:
         extra["reasoning_effort"] = "low"
 
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
     for attempt in range(MAX_RETRIES):
         try:
             response = _client.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=0,
+                max_completion_tokens=max_completion_tokens,
                 **extra,
             )
             time.sleep(PAUSE_BETWEEN_CALLS)
@@ -68,7 +83,8 @@ def llm(prompt, json_mode=True):
         except Exception as e:
             message = str(e).lower()
             retryable = any(
-                code in message for code in ("429", "503", "rate_limit", "overloaded")
+                code in message
+                for code in ("429", "503", "rate_limit", "overloaded", "json_validate_failed")
             )
             if retryable and attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt * 3)  # 3s, 6s, 12s, 24s...
@@ -78,12 +94,15 @@ def llm(prompt, json_mode=True):
     raise RuntimeError("Groq did not respond after several retries.")
 
 
-def llm_json(prompt, default=None):
+def llm_json(prompt, default=None, max_completion_tokens=2000, system=None):
     """Convenience wrapper: calls llm() in JSON mode and parses the result.
-    Returns `default` (an empty dict by default) if the model's reply isn't
-    valid JSON, so one bad reply never crashes the whole pipeline."""
-    raw = llm(prompt, json_mode=True)
+    Returns `default` (an empty dict by default) if the call fails for ANY
+    reason — a bad/cut-off JSON reply, a validation error Groq rejects
+    outright, a rate limit that outlasts the retries, anything — so one
+    stubborn batch never crashes the whole pipeline run. The caller sees an
+    empty result for that batch instead of a stack trace."""
     try:
+        raw = llm(prompt, json_mode=True, max_completion_tokens=max_completion_tokens, system=system)
         return json.loads(raw)
-    except json.JSONDecodeError:
+    except Exception:
         return default if default is not None else {}

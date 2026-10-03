@@ -15,6 +15,7 @@ import pandas as pd
 import psycopg2.extras
 
 from backend.llm import llm, llm_json, get_embedding
+from backend.prompts import CHAT_SYSTEM_PROMPT
 from backend.taxonomy import ISSUE_TAXONOMY, SENTIMENT, SEVERITY
 
 REQUIRED_COLUMNS = ["review_id", "review_date", "rating", "review_text", "product_category", "returned"]
@@ -372,23 +373,52 @@ def write_summary(results):
 # CHAT — runs on demand whenever the person types a question
 # =====================================================================================
 
+CHART_METRICS = ("reviews", "rate_pct", "avg_rating", "wow_pct")
+
+
+def build_chart(spec, results):
+    """Builds chart data from the already-computed stats. The LLM only picks
+    WHICH metric to plot; the numbers themselves always come from the database,
+    so the model can never invent them."""
+    if not isinstance(spec, dict) or spec.get("metric") not in CHART_METRICS:
+        return None
+    metric = spec["metric"]
+    rows = [p for p in results["problems"] if p.get(metric) is not None]
+    if not rows:
+        return None
+    data = pd.DataFrame(
+        {metric: [float(p[metric]) for p in rows]},
+        index=[p["problem"] for p in rows],
+    )
+    return {"type": "bar", "title": spec.get("title") or metric, "data": data}
+
+
 def answer_question(question, results, conn, upload_id):
+    """Returns (answer_text, source_review_ids, chart_or_None)."""
     relevant_reviews = search_reviews(conn, upload_id, question, k=10)
     evidence_text = "\n".join(f'- [{r["review_id"]}] {r["review_text"]}' for r in relevant_reviews)
-    stats_context = json.dumps(results["problems"], default=str)
 
-    prompt = f"""Here are stats already computed:
+    # Leave out each problem's bulky "evidence" list to keep the prompt small
+    compact_stats = [{k: v for k, v in p.items() if k != "evidence"} for p in results["problems"]]
+    stats_context = json.dumps(compact_stats, default=str)
+
+    prompt = f"""Stats already computed:
 {stats_context}
 
-Here are relevant customer reviews:
+Relevant customer reviews:
 {evidence_text}
 
-Question: {question}
-Answer using ONLY the stats and reviews above. Cite review IDs you used."""
+User message: {question}"""
 
-    answer = llm(prompt, json_mode=False)
+    reply = llm_json(
+        prompt,
+        system=CHAT_SYSTEM_PROMPT,
+        default={"answer": "Sorry, I couldn't generate a reply. Please try again.", "chart": None},
+    )
+    answer = reply.get("answer") or "Sorry, I couldn't generate a reply. Please try again."
+    chart = build_chart(reply.get("chart"), results)
     sources = [r["review_id"] for r in relevant_reviews]
-    return answer, sources
+    return answer, sources, chart
 
 
 # =====================================================================================
