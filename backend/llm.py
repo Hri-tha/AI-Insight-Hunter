@@ -37,12 +37,18 @@ def get_embedding(text):
     return get_embedder().encode(text)
 
 
-def llm(prompt, json_mode=True, max_completion_tokens=2000, system=None):
+def llm(prompt, json_mode=True, max_completion_tokens=2000, system=None, history=None):
     """
     Sends one prompt to Groq and returns the raw text reply.
 
     system: optional system prompt (the assistant's role, tone and rules).
     Leave it as None for the pipeline steps that don't need one.
+
+    history: optional list of earlier chat turns, each {"role": "user" or
+    "assistant", "content": "..."}. The model has NO memory of its own - every
+    call starts blank - so the only way it "remembers" the conversation is that
+    we re-send the earlier turns every time. They go between the system prompt
+    and the new question.
 
     json_mode=True tells Groq the reply MUST be a JSON object (a {...}, not
     a bare [...] list) — every prompt in this project that wants JSON back
@@ -67,6 +73,8 @@ def llm(prompt, json_mode=True, max_completion_tokens=2000, system=None):
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
+    if history:
+        messages.extend({"role": m["role"], "content": m["content"]} for m in history)
     messages.append({"role": "user", "content": prompt})
 
     for attempt in range(MAX_RETRIES):
@@ -94,7 +102,7 @@ def llm(prompt, json_mode=True, max_completion_tokens=2000, system=None):
     raise RuntimeError("Groq did not respond after several retries.")
 
 
-def llm_json(prompt, default=None, max_completion_tokens=2000, system=None):
+def llm_json(prompt, default=None, max_completion_tokens=2000, system=None, history=None):
     """Convenience wrapper: calls llm() in JSON mode and parses the result.
     Returns `default` (an empty dict by default) if the call fails for ANY
     reason — a bad/cut-off JSON reply, a validation error Groq rejects
@@ -102,7 +110,8 @@ def llm_json(prompt, default=None, max_completion_tokens=2000, system=None):
     stubborn batch never crashes the whole pipeline run. The caller sees an
     empty result for that batch instead of a stack trace."""
     try:
-        raw = llm(prompt, json_mode=True, max_completion_tokens=max_completion_tokens, system=system)
+        raw = llm(prompt, json_mode=True, max_completion_tokens=max_completion_tokens,
+                  system=system, history=history)
         return json.loads(raw)
     except Exception:
         return default if default is not None else {}

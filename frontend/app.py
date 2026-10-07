@@ -20,7 +20,7 @@ import pandas as pd
 import streamlit as st
 
 from backend.db import get_connection
-from backend.pipeline import REQUIRED_COLUMNS, run_pipeline, answer_question, load_run
+from backend.pipeline import REQUIRED_COLUMNS, run_pipeline, answer_question, load_run, MAX_HISTORY_MESSAGES
 
 st.set_page_config(page_title="AI Insight Hunter", layout="wide")
 st.title("AI Insight Hunter")
@@ -65,6 +65,85 @@ def make_sample_df():
             "returned": i % 3 == 0,
         })
     return pd.DataFrame(rows)
+
+
+def show_chart(chart):
+    """Draws a chart dict produced by backend.pipeline.build_chart_from_df."""
+    st.caption(chart["title"])
+    if chart.get("type") == "line":
+        st.line_chart(chart["data"])
+    else:
+        st.bar_chart(chart["data"])
+
+
+def render_chat(results=None, upload_id=None):
+    """The whole chat panel. Works with or without a current upload, because the
+    bot can query EVERYTHING already stored in the database."""
+    title_col, button_col = st.columns([3, 1])
+    title_col.subheader("Ask a question")
+
+    # NEW CHAT = just empty the list. The LLM only ever sees what we send it, and
+    # we only send chat_history, so an empty list means a completely fresh start.
+    if button_col.button("New chat", disabled=not st.session_state.chat_history):
+        st.session_state.chat_history = []
+        st.rerun()
+
+    scope = "all"
+    if upload_id:
+        choice = st.radio("Answer from", ["All uploaded data", "Current upload only"], horizontal=True)
+        scope = "current" if choice == "Current upload only" else "all"
+
+    # Replay the conversation so far
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+            if msg.get("chart"):
+                show_chart(msg["chart"])
+            if msg.get("sql"):
+                with st.expander("SQL used"):
+                    st.code(msg["sql"], language="sql")
+
+    question = st.chat_input("e.g. Which product has the most returns?  or  Show a chart of reviews per problem")
+    if not question:
+        return
+
+    # Take the history BEFORE adding the new question, so the question isn't sent twice.
+    # Only plain role/content go to the LLM (no charts, no SQL), failed replies are left out.
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.chat_history if not m.get("error")
+    ][-MAX_HISTORY_MESSAGES:]
+
+    st.session_state.chat_history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.write(question)
+
+    reply = {"answer": "", "chart": None, "sql": None}
+    failed = False
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            conn = get_connection()
+            try:
+                reply = answer_question(
+                    question, conn, upload_id=upload_id, results=results,
+                    history=history, scope=scope,
+                )
+            except Exception as e:
+                failed = True
+                reply["answer"] = f"Sorry, that failed: {e}"
+            finally:
+                conn.close()
+        st.write(reply["answer"])
+        if reply.get("chart"):
+            show_chart(reply["chart"])
+        if reply.get("sql"):
+            with st.expander("SQL used"):
+                st.code(reply["sql"], language="sql")
+
+    st.session_state.chat_history.append({
+        "role": "assistant", "content": reply["answer"],
+        "chart": reply.get("chart"), "sql": reply.get("sql"), "error": failed,
+    })
 
 
 # --- Upload section ---
@@ -161,38 +240,9 @@ if st.session_state.results:
                         st.write("**Data gaps:** " + ", ".join(inv["data_gaps"]))
 
     with chat_col:
-        st.subheader("Ask a question")
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-                if msg.get("chart"):
-                    st.caption(msg["chart"]["title"])
-                    st.bar_chart(msg["chart"]["data"])
-
-        question = st.chat_input("e.g. Why is Incorrect Fit rising?  or  Show a chart of reviews per problem")
-        if question:
-            st.session_state.chat_history.append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.write(question)
-
-            chart = None
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    conn = get_connection()
-                    try:
-                        answer, sources, chart = answer_question(
-                            question, results, conn, st.session_state.upload_id
-                        )
-                    except Exception as e:
-                        answer = f"Sorry, that failed: {e}"
-                    conn.close()
-                st.write(answer)
-                if chart:
-                    st.caption(chart["title"])
-                    st.bar_chart(chart["data"])
-
-            st.session_state.chat_history.append(
-                {"role": "assistant", "content": answer, "chart": chart}
-            )
+        render_chat(results, st.session_state.upload_id)
 else:
-    st.info("Upload a file (or click 'Use sample data') and click 'Run analysis' to get started.")
+    st.info("Upload a file (or click 'Use sample data') and click 'Run analysis' to get a dashboard. "
+            "You can also chat below about data uploaded earlier.")
+    st.divider()
+    render_chat()

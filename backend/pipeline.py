@@ -15,7 +15,8 @@ import pandas as pd
 import psycopg2.extras
 
 from backend.llm import llm, llm_json, get_embedding
-from backend.prompts import CHAT_SYSTEM_PROMPT
+from backend.prompts import CHAT_SYSTEM_PROMPT, SQL_SYSTEM_PROMPT
+from backend.sql_tools import run_readonly_query, dataframe_to_json
 from backend.taxonomy import ISSUE_TAXONOMY, SENTIMENT, SEVERITY
 
 REQUIRED_COLUMNS = ["review_id", "review_date", "rating", "review_text", "product_category", "returned"]
@@ -280,9 +281,13 @@ def generate_hypotheses(problem_stats):
 # =====================================================================================
 
 def search_reviews(conn, upload_id, query_text, problem_label=None, k=10):
+    """upload_id=None means "search every upload in the database"."""
     q_emb = get_embedding(query_text)
-    sql = "SELECT review_id, review_text, rating FROM reviews WHERE upload_id=%s AND embedding IS NOT NULL"
-    params = [upload_id]
+    sql = "SELECT review_id, review_text, rating FROM reviews WHERE embedding IS NOT NULL"
+    params = []
+    if upload_id:
+        sql += " AND upload_id=%s"
+        params.append(upload_id)
     if problem_label:
         sql += " AND problem=%s"
         params.append(problem_label)
@@ -371,16 +376,109 @@ def write_summary(results):
 
 # =====================================================================================
 # CHAT — runs on demand whenever the person types a question
+#
+# For every question we gather up to THREE kinds of context, then ask the LLM:
+#   1. SQL result   - the LLM writes a SELECT, we validate + run it on the WHOLE database
+#   2. Similar reviews - vector search (RAG) for qualitative "why" questions
+#   3. Dashboard stats - already-computed numbers for the current upload
+# Earlier chat turns are passed as `history` so follow-up questions work.
 # =====================================================================================
 
+MAX_HISTORY_MESSAGES = 8   # = last 4 question/answer pairs. Bigger = more tokens per call.
+MAX_SQL_ATTEMPTS = 2       # first try + one self-correction
 CHART_METRICS = ("reviews", "rate_pct", "avg_rating", "wow_pct")
+CHART_WORDS = ("chart", "graph", "plot", "visual", "compare", "comparison",
+               "distribution", "trend", "breakdown", "histogram")
+
+
+def wants_chart(question):
+    q = question.lower()
+    return any(w in q for w in CHART_WORDS)
+
+
+def generate_sql(question, history, upload_id, scope, chart_requested,
+                 previous_sql=None, previous_error=None):
+    """Asks the LLM to turn the question into a SQL query (or null)."""
+    notes = []
+    if scope == "current" and upload_id:
+        notes.append(f"Only use rows from the current upload: WHERE upload_id = '{upload_id}'.")
+    else:
+        notes.append("Use ALL uploads (do not filter on upload_id) unless the user asks about a specific file.")
+        if upload_id:
+            notes.append(f"For reference, the most recent upload_id is '{upload_id}'.")
+    if chart_requested:
+        notes.append("The user wants a chart: return exactly two columns (label, numeric value).")
+    if previous_sql:
+        notes.append(f"Your previous query failed.\nQuery: {previous_sql}\nError: {previous_error}\nWrite a corrected query.")
+
+    prompt = "\n".join(notes) + f"\n\nUser question: {question}"
+    result = llm_json(prompt, system=SQL_SYSTEM_PROMPT, history=history,
+                      default={"sql": None}, max_completion_tokens=800)
+    sql = result.get("sql")
+    return sql if isinstance(sql, str) and sql.strip() else None
+
+
+def fetch_sql_context(question, history, conn, upload_id, scope, chart_requested):
+    """Generate -> validate -> run. If the query fails, show the LLM its own
+    error and let it try ONE more time. Returns (dataframe_or_None, sql, error)."""
+    sql = generate_sql(question, history, upload_id, scope, chart_requested)
+    if not sql:
+        return None, None, None   # the question doesn't need the database
+
+    require_id = upload_id if scope == "current" else None
+    error = None
+    for attempt in range(MAX_SQL_ATTEMPTS):
+        try:
+            df, cleaned = run_readonly_query(conn, sql, require_upload_id=require_id)
+            return df, cleaned, None
+        except Exception as e:                       # UnsafeSQLError or a Postgres error
+            conn.rollback()
+            error = str(e).strip().splitlines()[0]
+            if attempt + 1 < MAX_SQL_ATTEMPTS:
+                retry = generate_sql(question, history, upload_id, scope, chart_requested,
+                                     previous_sql=sql, previous_error=error)
+                if not retry:
+                    break
+                sql = retry
+    return None, sql, error
+
+
+def build_chart_from_df(spec, df, force=False):
+    """Turns a SQL result into chart data. The LLM only picks WHICH columns to
+    plot; the numbers come from the database. If the LLM forgot to ask for a
+    chart but the user clearly wanted one (force=True), we still build one from
+    the first label column + first numeric column."""
+    if df is None or df.empty or len(df.columns) < 2:
+        return None
+    spec = spec if isinstance(spec, dict) else {}
+    if not spec and not force:
+        return None
+
+    x = spec.get("x")
+    if x not in df.columns:
+        x = df.columns[0]
+    numeric = [c for c in df.columns if c != x and pd.api.types.is_numeric_dtype(df[c])]
+    y = spec.get("y")
+    if y not in numeric:
+        if not numeric:
+            return None
+        y = numeric[0]
+
+    data = df[[x, y]].copy()
+    data[x] = data[x].astype(str)
+    data[y] = pd.to_numeric(data[y], errors="coerce")
+    data = data.dropna().groupby(x, sort=False)[y].sum().to_frame()   # one bar per label
+    if data.empty:
+        return None
+
+    kind = spec.get("type") if spec.get("type") in ("bar", "line") else "bar"
+    return {"type": kind, "title": spec.get("title") or f"{y} by {x}", "data": data}
 
 
 def build_chart(spec, results):
-    """Builds chart data from the already-computed stats. The LLM only picks
-    WHICH metric to plot; the numbers themselves always come from the database,
-    so the model can never invent them."""
-    if not isinstance(spec, dict) or spec.get("metric") not in CHART_METRICS:
+    """Older chart builder: plots a metric from the dashboard stats (current
+    upload only). Used only when there is no SQL result."""
+    if not results or not isinstance(spec, dict) or spec.get("metric") not in CHART_METRICS:
         return None
     metric = spec["metric"]
     rows = [p for p in results["problems"] if p.get(metric) is not None]
@@ -393,32 +491,68 @@ def build_chart(spec, results):
     return {"type": "bar", "title": spec.get("title") or metric, "data": data}
 
 
-def answer_question(question, results, conn, upload_id):
-    """Returns (answer_text, source_review_ids, chart_or_None)."""
-    relevant_reviews = search_reviews(conn, upload_id, question, k=10)
-    evidence_text = "\n".join(f'- [{r["review_id"]}] {r["review_text"]}' for r in relevant_reviews)
+def answer_question(question, conn, upload_id=None, results=None, history=None, scope="all"):
+    """Answers one chat message.
 
-    # Leave out each problem's bulky "evidence" list to keep the prompt small
-    compact_stats = [{k: v for k, v in p.items() if k != "evidence"} for p in results["problems"]]
-    stats_context = json.dumps(compact_stats, default=str)
+    history: earlier turns as [{"role": "user"/"assistant", "content": "..."}], oldest first,
+             NOT including `question` itself.
+    scope:   "all" = whole database, "current" = only `upload_id`.
+    Returns a dict: answer, sources, chart, sql, sql_error.
+    """
+    if scope == "current" and not upload_id:
+        scope = "all"
+    history = (history or [])[-MAX_HISTORY_MESSAGES:]
+    chart_requested = wants_chart(question)
 
-    prompt = f"""Stats already computed:
-{stats_context}
+    # 1) SQL over the whole database
+    sql_df, sql_used, sql_error = fetch_sql_context(
+        question, history, conn, upload_id, scope, chart_requested)
 
-Relevant customer reviews:
-{evidence_text}
+    # 2) Vector search. A short follow-up like "and why?" means nothing on its
+    #    own, so borrow the previous user question to give the search some meaning.
+    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    search_text = question if len(question.split()) > 6 else f"{last_user} {question}".strip()
+    relevant = search_reviews(conn, upload_id if scope == "current" else None, search_text, k=8)
+    evidence_text = "\n".join(f'- [{r["review_id"]}] {r["review_text"][:300]}' for r in relevant)
 
-User message: {question}"""
+    # 3) Build the prompt from whatever context we have
+    parts = []
+    if results:
+        keys = ("problem", "issue_category", "reviews", "rate_pct", "wow_pct",
+                "avg_rating", "severity", "decision")
+        compact = [{k: p.get(k) for k in keys} for p in results["problems"][:10]]
+        parts.append("Dashboard stats for the CURRENT upload:\n" + json.dumps(compact, default=str))
+    if sql_df is not None:
+        parts.append(f"SQL that was run on the database:\n{sql_used}\n\n"
+                     f"SQL result ({len(sql_df)} rows, columns: {list(sql_df.columns)}):\n"
+                     f"{dataframe_to_json(sql_df)}")
+    elif sql_error:
+        parts.append(f"A database query was attempted but failed ({sql_error}). "
+                     "Do not guess numbers; say you could not compute it.")
+    if evidence_text:
+        parts.append("Relevant customer reviews:\n" + evidence_text)
+    if chart_requested and sql_df is not None and not sql_df.empty:
+        parts.append("The user wants a chart. Set \"chart\" using exact column names from the SQL result.")
 
-    reply = llm_json(
-        prompt,
-        system=CHAT_SYSTEM_PROMPT,
-        default={"answer": "Sorry, I couldn't generate a reply. Please try again.", "chart": None},
-    )
-    answer = reply.get("answer") or "Sorry, I couldn't generate a reply. Please try again."
-    chart = build_chart(reply.get("chart"), results)
-    sources = [r["review_id"] for r in relevant_reviews]
-    return answer, sources, chart
+    prompt = "\n\n".join(parts) + f"\n\nUser message: {question}"
+
+    fallback = "Sorry, I couldn't generate a reply. Please try again."
+    reply = llm_json(prompt, system=CHAT_SYSTEM_PROMPT, history=history,
+                     default={"answer": fallback, "chart": None}, max_completion_tokens=1200)
+    answer = reply.get("answer") or fallback
+
+    chart = build_chart_from_df(reply.get("chart"), sql_df, force=chart_requested)
+    if chart is None and sql_df is None:
+        chart = build_chart(reply.get("chart"), results)
+
+    return {
+        "answer": answer,
+        "sources": [r["review_id"] for r in relevant],
+        "chart": chart,
+        "sql": sql_used,
+        "sql_error": sql_error,
+    }
+
 
 
 # =====================================================================================
